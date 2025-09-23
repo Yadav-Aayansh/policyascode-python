@@ -1,261 +1,256 @@
-import argparse, json, os, sys, base64, mimetypes, requests
+import argparse, json, os, sys, base64, mimetypes, logging
 from pathlib import Path
 from typing import Dict, List, Any
+import requests
 
-class PolicyAsCode:
-    def __init__(self):
-        self.config_dir = Path.home() / '.policyascode'
-        self.config_file = self.config_dir / 'config'
-        self.config = self.load_config()
-        self.schemas = self.load_schemas()
-        
-    def load_config(self) -> Dict[str, str]:
-        """Load configuration from file or environment"""
-        config = {"api_key": os.getenv('OPENAI_API_KEY', ''), "base_url": "https://openrouter.ai/api/v1", "model": "openai/gpt-4o-mini"}
-        if self.config_file.exists():
-            for line in self.config_file.read_text().splitlines():
-                if '=' in line and not line.startswith('#'):
-                    key, value = line.split('=', 1)
-                    key = key.strip().replace('POLICYASCODE_', '').lower()
-                    config[key] = value.strip().strip('"')
-        return config
-    
-    def save_config(self):
-        """Save configuration to file"""
-        self.config_dir.mkdir(exist_ok=True)
-        content = f"""# Policy as Code CLI Configuration\nPOLICYASCODE_API_KEY="{self.config['api_key']}"\nPOLICYASCODE_BASE_URL="{self.config['base_url']}"\nPOLICYASCODE_MODEL="{self.config['model']}"\n"""
-        self.config_file.write_text(content)
-        self.log_success(f"Configuration saved to {self.config_file}")
-    
-    def load_schemas(self) -> Dict[str, Any]:
-        """Load JSON schemas from config.json"""
-        config_path = Path(__file__).parent / 'config.json'
-        if not config_path.exists(): config_path = Path('config.json')
-        if config_path.exists(): return json.loads(config_path.read_text())['schemas']
-        return {}
-    
-    def log_info(self, msg): print(f"\033[0;34m[INFO]\033[0m {msg}", file=sys.stderr)
-    def log_success(self, msg): print(f"\033[0;32m[SUCCESS]\033[0m {msg}", file=sys.stderr)
-    def log_warn(self, msg): print(f"\033[1;33m[WARN]\033[0m {msg}", file=sys.stderr)
-    def log_error(self, msg): print(f"\033[0;31m[ERROR]\033[0m {msg}", file=sys.stderr)
-    
-    def get_file_content(self, filepath: str) -> Dict[str, Any]:
-        """Get file content based on type"""
-        path = Path(filepath)
-        if not path.exists(): raise FileNotFoundError(f"File not found: {filepath}")
-        mime_type, _ = mimetypes.guess_type(filepath)
-        filename = path.name
-        if mime_type == 'application/pdf':
-            with open(filepath, 'rb') as f: data = base64.b64encode(f.read()).decode()
-            return {"type": "input_file", "filename": filename, "file_data": f"data:application/pdf;base64,{data}"}
-        else:
-            content = path.read_text(encoding='utf-8')
-            return {"type": "input_text", "text": f"# {filename}\n\n{content}"}
-    
-    def call_llm(self, instructions: str, content: Any, schema: Dict) -> Dict:
-        """Make API call to LLM"""
-        if not self.config.get('api_key'): raise ValueError("API key not configured. Run: policyascode config --api-key YOUR_KEY")
-        if isinstance(content, dict): text_content = content.get('text', content.get('file_data', ''))
-        else: text_content = str(content)
-        text_content = ''.join(c for c in text_content if ord(c) >= 32 or c in '\n\t')
-        enhanced_instructions = f"{instructions}\n\nPlease respond with valid JSON matching this schema:\n{json.dumps(schema, separators=(',', ':'))}"
-        headers = {"Authorization": f"Bearer {self.config['api_key']}", "Content-Type": "application/json", "HTTP-Referer": "policyascode-cli", "X-Title": "Policy as Code CLI"}
-        payload = {"model": self.config['model'], "messages": [{"role": "system", "content": enhanced_instructions}, {"role": "user", "content": text_content}], "response_format": {"type": "json_object"}, "stream": False}
-        self.log_info(f"Making API call to {self.config['base_url']}/chat/completions...")
-        self.log_info(f"Using model: {self.config['model']}")
-        response = requests.post(f"{self.config['base_url']}/chat/completions", headers=headers, json=payload, timeout=60)
-        if response.status_code != 200: 
-            error_msg = f"API Error {response.status_code}: {response.text}"
-            self.log_error(error_msg)
-            raise Exception(error_msg)
-        result = response.json()
-        if 'error' in result:
-            error_msg = f"API Error: {result['error'].get('message', 'Unknown error')}"
-            self.log_error(error_msg)
-            raise Exception(error_msg)
-        content = result['choices'][0]['message']['content']
-        if not content: raise Exception("No content returned from API")
-        content = ''.join(c for c in content if ord(c) >= 32 or c in '\n\t')
-        try: return json.loads(content)
-        except json.JSONDecodeError as e:
-            self.log_error(f"Invalid JSON returned: {e}")
-            raise Exception(f"Invalid JSON returned from API: {e}")
-    
-    def extract_rules(self, files: List[str], output: str, extraction_prompt: str = None):
-        """Extract rules from documents"""
-        if not extraction_prompt: extraction_prompt = """Extract atomic, testable rules from this policy document.
-Keep each rule minimal.
-Write for an LLM to apply it unambiguously.
-Always include concise rationale and quotes.
-Each rule should be specific to this document and its context."""
-        self.log_info(f"Extracting rules from {len(files)} files...")
-        all_rules, rule_index = [], 0
-        for filepath in files:
-            try:
-                self.log_info(f"Processing file: {filepath}")
-                content = self.get_file_content(filepath)
-                result = self.call_llm(extraction_prompt, content, self.schemas['rules'])
-                rules = result.get('rules', [])
-                filename = Path(filepath).name
-                for i, rule in enumerate(rules):
-                    rule.update({'id': f'rule-{rule_index + i}', 'source_file': filename})
-                    for source in rule.get('sources', []): source['file'] = filename
-                all_rules.extend(rules)
-                rule_index += len(rules)
-                self.log_success(f"Extracted {len(rules)} rules from {filepath}")
-            except Exception as e: self.log_error(f"Error processing {filepath}: {e}")
-        Path(output).write_text(json.dumps({"rules": all_rules}, indent=2))
-        self.log_success(f"Extracted {len(all_rules)} total rules to {output}")
-    
-    def consolidate_rules(self, input_file: str, output_file: str, consolidation_prompt: str = None):
-        """Consolidate rules by removing duplicates and merging similar ones"""
-        if not consolidation_prompt: consolidation_prompt = "Suggest deletes and merges to remove duplicates and generalize rules where appropriate."
-        self.log_info(f"Loading rules from {input_file}")
-        data = json.loads(Path(input_file).read_text())
-        rules = data.get('rules', [])
-        if not rules: 
-            self.log_error("No rules found in input file")
-            return
-        self.log_info("Consolidating rules...")
-        content = {"type": "input_text", "text": json.dumps(rules)}
-        result = self.call_llm(consolidation_prompt, content, self.schemas['edits'])
-        edits = result.get('edits', [])
-        if not edits:
-            self.log_info("No consolidation edits suggested")
-            Path(output_file).write_text(json.dumps(data, indent=2))
-            return
-        rule_lookup = {rule['id']: rule for rule in rules}
-        to_delete = set()
-        merged_rules = []
-        for edit in edits:
-            if edit['edit'] in ['delete', 'merge']: to_delete.update(edit['ids'])
-            if edit['edit'] == 'merge':
-                merged_sources = []
-                source_files = []
-                for rule_id in edit['ids']:
-                    if rule_id in rule_lookup:
-                        merged_sources.extend(rule_lookup[rule_id].get('sources', []))
-                        source_files.append(rule_lookup[rule_id].get('source_file', ''))
-                merged_rule = {'id': f"rule-merged-{'-'.join(edit['ids'])}", 'title': edit['title'], 'body': edit['body'], 'priority': edit['priority'], 'rationale': edit['rationale'], 'source_file': ', '.join(set(f for f in source_files if f)) or 'merged', 'sources': merged_sources}
-                merged_rules.append(merged_rule)
-        final_rules = [rule for rule in rules if rule['id'] not in to_delete] + merged_rules
-        Path(output_file).write_text(json.dumps({"rules": final_rules}, indent=2))
-        self.log_success(f"Applied {len(edits)} consolidation edits, resulting in {len(final_rules)} rules saved to {output_file}")
-    
-    def validate_documents(self, rules_file: str, documents: List[str], output_file: str = None, validation_prompt: str = None):
-        """Validate documents against rules"""
-        if not validation_prompt: validation_prompt = """Validate the provided document against the given rules that originated from this same document.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger("policyascode")
 
-For each rule, determine if the document passes, fails, is not applicable, or if it's unknown/unclear.
+CONFIG_DIR = Path.home() / ".policyascode"
+CONFIG_FILE = CONFIG_DIR / "config"
+SCHEMA_FILE = Path(__file__).resolve().parent / "config.json"
+PROMPT_FILE = Path(__file__).resolve().parent / "prompt.json"
 
-Return a validation result for each rule with:
-- id: the rule identifier
-- result: "pass" if the document complies, "fail" if it violates the rule, "n/a" if the rule is not applicable to this document, "unknown" if unclear or needs human review
-- reason: brief explanation of why it passes, fails, is not applicable, or is unknown
+def load_config() -> Dict[str, str]:
+    cfg = {
+        "api_key": os.getenv("OPENAI_API_KEY", ""),
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "openai/gpt-4o-mini"
+    }
+    if CONFIG_FILE.exists():
+        for line in CONFIG_FILE.read_text().splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                cfg[k.strip().replace("POLICYASCODE_", "").lower()] = v.strip().strip('"')
+    return cfg
 
-Be specific and cite relevant parts of the document in your reasoning.
+def save_config(cfg: Dict[str, str]) -> None:
+    CONFIG_DIR.mkdir(exist_ok=True)
+    CONFIG_FILE.write_text(
+        f'# Policy as Code CLI Configuration\n'
+        f'POLICYASCODE_API_KEY="{cfg["api_key"]}"\n'
+        f'POLICYASCODE_BASE_URL="{cfg["base_url"]}"\n'
+        f'POLICYASCODE_MODEL="{cfg["model"]}"\n'
+    )
+    logger.info(f"Configuration saved to {CONFIG_FILE}")
 
-Only validate rules that were originally extracted from this document or are applicable to it."""
-        rules_data = json.loads(Path(rules_file).read_text())
-        rules = rules_data.get('rules', [])
-        if not rules: 
-            self.log_error("No rules found in rules file")
-            return
-        all_validations = []
-        for filepath in documents:
-            self.log_info(f"Validating file: {filepath}")
-            filename = Path(filepath).name
-            applicable_rules = [rule for rule in rules if (rule.get('source_file') == filename or filename in rule.get('source_file', '') or any(filename in sf for sf in rule.get('source_files', [])))]
-            if not applicable_rules:
-                self.log_warn(f"No applicable rules found for {filepath}")
-                continue
-            self.log_info(f"Found {len(applicable_rules)} applicable rules for {filepath}")
-            try:
-                content = self.get_file_content(filepath)
-                full_prompt = f"{validation_prompt}\n\nRules to validate against:\n{json.dumps(applicable_rules)}"
-                result = self.call_llm(full_prompt, content, self.schemas['validation'])
-                validations = result.get('validations', [])
-                for validation in validations: validation['file'] = filename
-                all_validations.extend(validations)
-                self.log_success(f"Validated {len(validations)} applicable rules against {filepath}")
-            except Exception as e: self.log_error(f"Failed to validate {filepath}: {e}")
-        if output_file:
-            Path(output_file).write_text(json.dumps({"validations": all_validations}, indent=2))
-            self.log_success(f"Validation results saved to {output_file}")
-        else:
-            by_file = {}
-            for v in all_validations:
-                file = v['file']
-                if file not in by_file: by_file[file] = []
-                by_file[file].append(v)
-            for file, validations in by_file.items():
-                print(f"\n=== Validation Results for {file} ===")
-                for v in validations:
-                    status = {'pass': '✅', 'fail': '❌', 'n/a': '⚪', 'unknown': '❓'}.get(v['result'], '?')
-                    print(f"{status} {v['id']}: {v['result'].upper()} - {v['reason']}")
-                print(f"  Total: {len(validations)} rules validated")
+def load_json(path: Path) -> Dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
-def main():
-    parser = argparse.ArgumentParser(description="Policy as Code CLI")
-    parser.add_argument('--model', help='LLM model to use')
-    parser.add_argument('--base-url', help='API base URL')
-    parser.add_argument('--api-key', help='API key')
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
-    extract_parser = subparsers.add_parser('extract', help='Extract rules from documents')
-    extract_parser.add_argument('-o', '--output', required=True, help='Output JSON file')
-    extract_parser.add_argument('--extraction-prompt', help='Custom extraction prompt')
-    extract_parser.add_argument('files', nargs='+', help='Input documents')
-    consolidate_parser = subparsers.add_parser('consolidate', help='Consolidate rules')
-    consolidate_parser.add_argument('-i', '--input', required=True, help='Input rules JSON file')
-    consolidate_parser.add_argument('-o', '--output', required=True, help='Output consolidated JSON file')
-    consolidate_parser.add_argument('--consolidation-prompt', help='Custom consolidation prompt')
-    validate_parser = subparsers.add_parser('validate', help='Validate documents against rules')
-    validate_parser.add_argument('-r', '--rules', required=True, help='Rules JSON file')
-    validate_parser.add_argument('-o', '--output', help='Output JSON file for validation results')
-    validate_parser.add_argument('--validation-prompt', help='Custom validation prompt')
-    validate_parser.add_argument('files', nargs='+', help='Documents to validate')
-    config_parser = subparsers.add_parser('config', help='Configure API settings')
-    config_parser.add_argument('--api-key', help='Set API key')
-    config_parser.add_argument('--base-url', help='Set API base URL')
-    config_parser.add_argument('--model', help='Set default model')
-    config_parser.add_argument('--show', action='store_true', help='Show current configuration')
-    args = parser.parse_args()
-    if not args.command:
-        parser.print_help()
-        return
-    pac = PolicyAsCode()
-    if args.model: pac.config['model'] = args.model
-    if args.base_url: pac.config['base_url'] = args.base_url
-    if args.api_key: pac.config['api_key'] = args.api_key
+SCHEMAS = load_json(SCHEMA_FILE).get("schemas", {})
+PROMPTS = load_json(PROMPT_FILE)
+
+def get_file_content(path: str) -> Dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    mime, _ = mimetypes.guess_type(path)
+    if mime == "application/pdf":
+        return {
+            "type": "input_file",
+            "filename": p.name,
+            "file_data": f"data:application/pdf;base64,{base64.b64encode(p.read_bytes()).decode()}"
+        }
+    return {
+        "type": "input_text",
+        "text": f"# {p.name}\n\n{p.read_text(encoding='utf-8')}"
+    }
+
+def call_llm(cfg: Dict[str, str], instructions: str, content: Any, schema: Dict) -> Dict:
+    if not cfg.get("api_key"):
+        raise ValueError("API key not configured. Run: policyascode config --api-key YOUR_KEY")
+    text = content.get("text", content.get("file_data", "")) if isinstance(content, dict) else str(content)
+    safe_text = "".join(c for c in text if ord(c) >= 32 or c in "\n\t")
+    
+    payload = {
+        "model": cfg["model"],
+        "messages": [
+            {
+                "role": "system",
+                "content": f"{instructions}\n\nRespond with valid JSON matching this schema:\n{json.dumps(schema, separators=(',', ':'))}"
+            },
+            {
+                "role": "user",
+                "content": safe_text
+            }
+        ],
+        "response_format": {"type": "json_object"},
+        "stream": False
+    }
+    headers = {
+        "Authorization": f"Bearer {cfg['api_key']}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "policyascode-cli",
+        "X-Title": "Policy as Code CLI"
+    }
+    
+    logger.info(f"Calling model {cfg['model']} at {cfg['base_url']}")
+    r = requests.post(f"{cfg['base_url']}/chat/completions", headers=headers, json=payload, timeout=60)
+    
+    if r.status_code != 200:
+        raise RuntimeError(f"API Error {r.status_code}: {r.text}")
+    result = r.json()
+    if "error" in result:
+        raise RuntimeError(result["error"].get("message", "Unknown API error"))
+    
     try:
-        if args.command == 'config':
-            if args.api_key: pac.config['api_key'] = args.api_key
-            if args.base_url: pac.config['base_url'] = args.base_url
-            if args.model: pac.config['model'] = args.model
+        return json.loads(result["choices"][0]["message"]["content"])
+    except (KeyError, json.JSONDecodeError) as e:
+        raise RuntimeError(f"Invalid JSON returned: {e}")
+
+def extract_rules(cfg: Dict[str, str], files: List[str], out: str, custom_prompt: str = None) -> None:
+    prompt = custom_prompt or PROMPTS.get("extract")
+    all_rules = []
+    idx = 0
+    
+    for f in files:
+        try:
+            logger.info(f"Processing {f}")
+            content = get_file_content(f)
+            fname = Path(f).name
+            rules = call_llm(cfg, prompt, content, SCHEMAS["rules"]).get("rules", [])
+            
+            for i, r in enumerate(rules):
+                r.update({"id": f"rule-{idx+i}", "source_file": fname})
+                for s in r.get("sources", []):
+                    s["file"] = fname
+            
+            all_rules.extend(rules)
+            idx += len(rules)
+            logger.info(f"Extracted {len(rules)} rules from {f}")
+        except Exception as e:
+            logger.error(f"{f}: {e}")
+    
+    Path(out).write_text(json.dumps({"rules": all_rules}, indent=2))
+    logger.info(f"Saved {len(all_rules)} total rules to {out}")
+
+def consolidate_rules(cfg: Dict[str, str], inp: str, out: str, custom_prompt: str = None) -> None:
+    rules = load_json(Path(inp)).get("rules", [])
+    if not rules:
+        return logger.error("No rules found")
+    
+    prompt = custom_prompt or PROMPTS.get("consolidate")
+    edits = call_llm(cfg, prompt, {"type": "input_text", "text": json.dumps(rules)}, SCHEMAS["edits"]).get("edits", [])
+    
+    if not edits:
+        logger.info("No consolidation edits suggested")
+        Path(out).write_text(json.dumps({"rules": rules}, indent=2))
+        return
+    
+    lookup = {r["id"]: r for r in rules}
+    to_delete = set()
+    merged = []
+    
+    for e in edits:
+        if e["edit"] in {"delete", "merge"}:
+            to_delete.update(e["ids"])
+        if e["edit"] == "merge":
+            merged_sources = [s for rid in e["ids"] if rid in lookup for s in lookup[rid].get("sources", [])]
+            src_files = list(set(lookup[rid].get("source_file", "") for rid in e["ids"] if rid in lookup))
+            merged.append({
+                "id": f"rule-merged-{'-'.join(e['ids'])}",
+                "title": e["title"],
+                "body": e["body"],
+                "priority": e["priority"],
+                "rationale": e["rationale"],
+                "source_file": ", ".join(src_files) or "merged",
+                "sources": merged_sources
+            })
+    
+    final_rules = [r for r in rules if r["id"] not in to_delete] + merged
+    Path(out).write_text(json.dumps({"rules": final_rules}, indent=2))
+    logger.info(f"Applied {len(edits)} edits -> {len(final_rules)} rules saved to {out}")
+
+def validate_documents(cfg: Dict[str, str], rules_file: str, docs: List[str], out: str = None, custom_prompt: str = None) -> None:
+    rules = load_json(Path(rules_file)).get("rules", [])
+    if not rules:
+        return logger.error("No rules found")
+    
+    validations = []
+    prompt_base = custom_prompt or PROMPTS.get("validate")
+    
+    for f in docs:
+        fname = Path(f).name
+        applicable = [r for r in rules if fname in r.get("source_file", "")]
+        if not applicable:
+            logger.warning(f"No applicable rules for {fname}")
+            continue
+        
+        logger.info(f"Validating {fname} with {len(applicable)} rules")
+        try:
+            content = get_file_content(f)
+            result = call_llm(cfg, f"{prompt_base}\n\nRules:\n{json.dumps(applicable)}", content, SCHEMAS["validation"])
+            for v in result.get("validations", []):
+                v["file"] = fname
+            validations.extend(result.get("validations", []))
+        except Exception as e:
+            logger.error(f"{f}: {e}")
+    
+    if out:
+        Path(out).write_text(json.dumps({"validations": validations}, indent=2))
+        logger.info(f"Validation results saved to {out}")
+    else:
+        for v in validations:
+            status = {"pass": "✅", "fail": "❌", "n/a": "⚪", "unknown": "❓"}.get(v["result"], "?")
+            print(f"{status} {v['file']} :: {v['id']} -> {v['result'].upper()} - {v['reason']}")
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Policy as Code CLI")
+    p.add_argument("--model")
+    p.add_argument("--base-url")
+    p.add_argument("--api-key")
+    sub = p.add_subparsers(dest="cmd")
+
+    e = sub.add_parser("extract", help="Extract rules from documents")
+    e.add_argument("-o", "--output", required=True)
+    e.add_argument("--extraction-prompt")
+    e.add_argument("files", nargs="+")
+
+    c = sub.add_parser("consolidate", help="Consolidate rules")
+    c.add_argument("-i", "--input", required=True)
+    c.add_argument("-o", "--output", required=True)
+    c.add_argument("--consolidation-prompt")
+
+    v = sub.add_parser("validate", help="Validate documents against rules")
+    v.add_argument("-r", "--rules", required=True)
+    v.add_argument("-o", "--output")
+    v.add_argument("--validation-prompt")
+    v.add_argument("files", nargs="+")
+
+    conf = sub.add_parser("config", help="Configure API settings")
+    conf.add_argument("--api-key")
+    conf.add_argument("--base-url")
+    conf.add_argument("--model")
+    conf.add_argument("--show", action="store_true")
+
+    args = p.parse_args()
+    if not args.cmd:
+        return p.print_help()
+
+    cfg = load_config()
+    if args.model:
+        cfg["model"] = args.model
+    if args.base_url:
+        cfg["base_url"] = args.base_url
+    if args.api_key:
+        cfg["api_key"] = args.api_key
+
+    try:
+        if args.cmd == "config":
             if args.show:
-                print("Current configuration:")
-                print(f"  API Key: {pac.config['api_key'][:10]}..." if pac.config['api_key'] else "  API Key: Not set")
-                print(f"  Base URL: {pac.config['base_url']}")
-                print(f"  Model: {pac.config['model']}")
-                print(f"  Config file: {pac.config_file}")
-            else: pac.save_config()
-        elif args.command == 'extract':
-            if not pac.config.get('api_key'):
-                pac.log_error("API key is required. Set it using: policyascode config --api-key <your-key>")
-                sys.exit(1)
-            pac.extract_rules(args.files, args.output, args.extraction_prompt)
-        elif args.command == 'consolidate':
-            if not pac.config.get('api_key'):
-                pac.log_error("API key is required. Set it using: policyascode config --api-key <your-key>")
-                sys.exit(1)
-            pac.consolidate_rules(args.input, args.output, args.consolidation_prompt)
-        elif args.command == 'validate':
-            if not pac.config.get('api_key'):
-                pac.log_error("API key is required. Set it using: policyascode config --api-key <your-key>")
-                sys.exit(1)
-            pac.validate_documents(args.rules, args.files, args.output, args.validation_prompt)
+                print(f"Current configuration:\n  API Key: {cfg['api_key'][:10]}..." if cfg["api_key"] else "  API Key: Not set")
+                print(f"  Base URL: {cfg['base_url']}\n  Model: {cfg['model']}\n  Config file: {CONFIG_FILE}")
+            else:
+                save_config(cfg)
+        elif args.cmd == "extract":
+            extract_rules(cfg, args.files, args.output, args.extraction_prompt)
+        elif args.cmd == "consolidate":
+            consolidate_rules(cfg, args.input, args.output, args.consolidation_prompt)
+        elif args.cmd == "validate":
+            validate_documents(cfg, args.rules, args.files, args.output, args.validation_prompt)
     except Exception as e:
-        pac.log_error(str(e))
+        logger.error(e)
         sys.exit(1)
 
-if __name__ == '__main__': main()
+if __name__ == "__main__":
+    main()
