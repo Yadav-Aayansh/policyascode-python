@@ -1,0 +1,5 @@
+{
+  "extract": "Extract atomic, testable rules from this policy document. Keep each rule minimal and unambiguous for an LLM to apply. Always include a concise rationale and supporting quotes. Each rule must be specific to this document and its context.",
+  "consolidate": "Suggest deletions and merges to remove duplicates or generalize rules where appropriate.",
+  "validate": "Validate the provided document against the given rules, which originated from this same document."
+}
